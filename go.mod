@@ -1,13 +1,15 @@
-module chromeproxy
+module github.com/ambeloe/chromeproxy
 
-go 1.21.1
+go 1.21
 
-require github.com/Davincible/chromedp-undetected v1.3.8
+require (
+	github.com/Davincible/chromedp-undetected v1.3.8
+	github.com/chromedp/chromedp v0.9.1
+)
 
 require (
 	github.com/Xuanwo/go-locale v1.1.0 // indirect
 	github.com/chromedp/cdproto v0.0.0-20230220211738-2b1ec77315c9 // indirect
-	github.com/chromedp/chromedp v0.9.1 // indirect
 	github.com/chromedp/sysutil v1.0.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect

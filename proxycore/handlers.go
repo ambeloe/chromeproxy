@@ -1,12 +1,10 @@
 package proxycore
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	cu "github.com/Davincible/chromedp-undetected"
-	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/chromedp"
 	"math/rand"
 	"net/http"
@@ -180,14 +178,8 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 
 	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
 		chromedp.Navigate(string(url)),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			node, err := dom.GetDocument().Do(ctx)
-			if err != nil {
-				return err
-			}
-			page, err = dom.GetOuterHTML().WithNodeID(node.NodeID).Do(ctx)
-			return err
-		}),
+		chromedp.OuterHTML("body", &page, chromedp.ByQuery),
+		//chromedp.Text("", &page, chromedp.ByQuery),
 	)
 	if err != nil {
 		//arbitrary data being passed to console

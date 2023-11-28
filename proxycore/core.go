@@ -38,7 +38,7 @@ func killSession(userKey string, id uint32) error {
 
 // AddUser adds a user if they don't already exist
 func AddUser(userKey string) {
-	if _, exists := Users[userKey]; exists {
+	if _, exists := Users[userKey]; !exists {
 		Users[userKey] = map[uint32]Session{}
 	}
 }
