@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	cu "github.com/Davincible/chromedp-undetected"
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
+	"image"
+	"image/color"
 	"math/rand"
 	"net/http"
 	"os"
@@ -55,7 +58,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	sess.Ctx, sess.Cf, err = cu.New(cu.NewConfig(
-		cu.WithHeadless(),
+		//cu.WithHeadless(),
 		cu.WithChromeFlags(chromedp.UserDataDir(sess.UserDir)),
 		cu.WithTimeout(time.Duration(1<<63-1)), //because why the hell does the chrome handle expire
 	))
@@ -176,8 +179,56 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	var nodeTemp []*cdp.Node
+	//var iframePic []byte
+
 	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
 		chromedp.Navigate(string(url)),
+		chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch),
+	)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	//todo: funny image captcha
+	if len(nodeTemp) > 0 && nodeTemp[0].NodeValue == "Cloudflare" {
+		//page protected by cf
+
+		_, _ = fmt.Fprintf(os.Stdout, "bypassing cf challenge on page %s...\n", string(url))
+
+		//for {
+		//	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+		//		chromedp.Screenshot("//div[\"turnstile-wrapper\"]/iframe", &iframePic, chromedp.ByJSPath),
+		//	)
+		//	if err != nil {
+		//		_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
+		//		writer.WriteHeader(http.StatusInternalServerError)
+		//		return
+		//	}
+		//	elImg, _ := png.Decode(bytes.NewReader(iframePic))
+		//
+		//	fmt.Println(calculateModalAverageColour(elImg))
+		//	time.Sleep(250 * time.Millisecond)
+		//}
+
+		//click button to start solve
+		err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+			//chromedp.WaitReady("//div[\"turnstile-wrapper\"]/iframe", chromedp.ByJSPath),
+			//todo: actual solution (stopped getting challenges before i could finish)
+			chromedp.Sleep(10*time.Second),
+			chromedp.Click("//div[\"turnstile-wrapper\"]/iframe/..", chromedp.BySearch),
+			chromedp.WaitNotVisible("//*[@id=\"footer-text\"]/a", chromedp.BySearch),
+		)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
 		chromedp.OuterHTML("body", &page, chromedp.ByQuery),
 		//chromedp.Text("", &page, chromedp.ByQuery),
 	)
@@ -191,4 +242,30 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write([]byte(page))
 	return
+}
+
+type PixelColor [3]uint8
+
+func calculateModalAverageColour(img image.Image) PixelColor {
+	imgSize := img.Bounds().Size()
+
+	var redTotal, greenTotal, blueTotal, pixelsCount int64
+
+	for x := 0; x < imgSize.X; x++ {
+		for y := 0; y < imgSize.Y; y++ {
+			cc := color.RGBAModel.Convert(img.At(x, y)).(color.RGBA)
+
+			redTotal += int64(cc.R)
+			greenTotal += int64(cc.G)
+			blueTotal += int64(cc.B)
+
+			pixelsCount++
+		}
+	}
+
+	r := uint8(redTotal / pixelsCount)
+	g := uint8(greenTotal / pixelsCount)
+	b := uint8(blueTotal / pixelsCount)
+
+	return PixelColor{r, g, b}
 }
