@@ -1,6 +1,7 @@
 package proxycore
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"github.com/chromedp/chromedp"
 	"image"
 	"image/color"
+	"image/png"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -58,9 +61,9 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	sess.Ctx, sess.Cf, err = cu.New(cu.NewConfig(
-		cu.WithHeadless(),
+		//cu.WithHeadless(),
 		cu.WithChromeFlags(chromedp.UserDataDir(sess.UserDir)),
-		cu.WithTimeout(time.Duration(1<<63-1)), //because why the hell does the chrome handle expire
+		cu.WithTimeout(time.Duration(math.MaxInt64)), //because why the hell does the chrome handle expire
 	))
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "error creating session with tempdir %s: %v\n", sess.UserDir, err)
@@ -180,9 +183,11 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	var nodeTemp []*cdp.Node
-	//var iframePic []byte
+	var iframePic []byte
 
 	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+		//ensures captcha for development
+		//cu.UserAgentOverride("Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36"),
 		chromedp.Navigate(string(url)),
 		chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch),
 	)
@@ -198,26 +203,49 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 
 		_, _ = fmt.Fprintf(os.Stdout, "bypassing cf challenge on page %s...\n", string(url))
 
-		//for {
-		//	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
-		//		chromedp.Screenshot("//div[\"turnstile-wrapper\"]/iframe", &iframePic, chromedp.ByJSPath),
-		//	)
-		//	if err != nil {
-		//		_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
-		//		writer.WriteHeader(http.StatusInternalServerError)
-		//		return
-		//	}
-		//	elImg, _ := png.Decode(bytes.NewReader(iframePic))
-		//
-		//	fmt.Println(calculateModalAverageColour(elImg))
-		//	time.Sleep(250 * time.Millisecond)
-		//}
+		for {
+			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+				chromedp.Nodes("//div[\"turnstile-wrapper\"]/", &nodeTemp, chromedp.BySearch),
+			)
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "error getting nodes on page %s: %v", string(url), err)
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if len(nodeTemp) > 0 {
+				fmt.Println("no iframe")
+				goto challengePassed
+			}
+
+			//try to take screenshot of challenge
+			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+				chromedp.Screenshot("//div[\"turnstile-wrapper\"]/iframe", &iframePic, chromedp.BySearch),
+			)
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			elImg, _ := png.Decode(bytes.NewReader(iframePic))
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "chromedp returned invalid png screenshot: %v", err)
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			c := calculateModalAverageColour(elImg)
+
+			//check how far average color is from known image of challenge checkbox state
+			if math.Abs(float64(c[0])-238)+math.Abs(float64(c[1])-246)+math.Abs(float64(c[2])-235) < 2 {
+				break
+			}
+		}
 
 		//click button to start solve
 		err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
 			//chromedp.WaitReady("//div[\"turnstile-wrapper\"]/iframe", chromedp.ByJSPath),
-			//todo: actual solution (stopped getting challenges before i could finish)
-			chromedp.Sleep(10*time.Second),
+			//chromedp.Sleep(10*time.Second),
 			chromedp.Click("//div[\"turnstile-wrapper\"]/iframe/..", chromedp.BySearch),
 			chromedp.WaitNotVisible("//*[@id=\"footer-text\"]/a", chromedp.BySearch),
 		)
@@ -226,9 +254,12 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+	challengePassed:
+		fmt.Println("cf bypassed")
 	}
 
 	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+		//chromedp.Navigate(string(url)),
 		chromedp.OuterHTML("body", &page, chromedp.ByQuery),
 		//chromedp.Text("", &page, chromedp.ByQuery),
 	)
