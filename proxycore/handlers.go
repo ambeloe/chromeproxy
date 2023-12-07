@@ -2,6 +2,7 @@ package proxycore
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,16 @@ import (
 	"os"
 	"strconv"
 	"time"
+)
+
+const (
+	stateInitialCheck = iota
+
+	stateCloudflareLoadWait
+	stateCloudflareCheckbox
+	stateCloudflareFinishWait
+
+	stateUnprotectedGet
 )
 
 func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
@@ -61,7 +72,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	sess.Ctx, sess.Cf, err = cu.New(cu.NewConfig(
-		//cu.WithHeadless(),
+		cu.WithHeadless(),
 		cu.WithChromeFlags(chromedp.UserDataDir(sess.UserDir)),
 		cu.WithTimeout(time.Duration(math.MaxInt64)), //because why the hell does the chrome handle expire
 	))
@@ -184,99 +195,180 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 
 	var nodeTemp []*cdp.Node
 	var iframePic []byte
+	var elImg image.Image
 
-	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
-		//ensures captcha for development
-		//cu.UserAgentOverride("Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36"),
-		chromedp.Navigate(string(url)),
-		chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch),
-	)
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
-		writer.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	//todo: funny image captcha
-	if len(nodeTemp) > 0 && nodeTemp[0].NodeValue == "Cloudflare" {
-		//page protected by cf
-
-		_, _ = fmt.Fprintf(os.Stdout, "bypassing cf challenge on page %s...\n", string(url))
-
-		for {
+	var state = stateInitialCheck
+	var passTime time.Time
+	for {
+	switchStart:
+		fmt.Printf("[%s] state: %d\n", time.Now().Format("2006-01-02 15:04:05.999999999"), state)
+		switch state {
+		case stateInitialCheck:
 			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
-				chromedp.Nodes("//div[\"turnstile-wrapper\"]/", &nodeTemp, chromedp.BySearch),
+				//ensures captcha for development (never lets you pass though)
+				//cu.UserAgentOverride("Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36"),
+				chromedp.Navigate(string(url)),
 			)
-			if err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "error getting nodes on page %s: %v", string(url), err)
+			if err != nil && err != context.DeadlineExceeded {
+				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			if len(nodeTemp) > 0 {
-				fmt.Println("no iframe")
-				goto challengePassed
+
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+				chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
+			)
+			if err != nil && err != context.DeadlineExceeded {
+				_, _ = fmt.Fprintf(os.Stderr, "error finding footer on page %s: %v\n", string(url), err)
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 
-			//try to take screenshot of challenge
+			if len(nodeTemp) > 0 && nodeTemp[0].NodeValue == "Cloudflare" {
+				_, _ = fmt.Fprintf(os.Stdout, "bypassing cf challenge on page %s...\n", string(url))
+				state = stateCloudflareLoadWait
+			} else {
+				state = stateUnprotectedGet
+			}
+		case stateCloudflareLoadWait:
+			{
+				err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+					chromedp.Nodes("//div[@id=\"challenge-success\"]/", &nodeTemp, chromedp.BySearch, chromedp.NodeReady),
+				)
+				if err != nil && err != context.DeadlineExceeded {
+					_, _ = fmt.Fprintf(os.Stderr, "error checking for success on page %s: %v\n", string(url), err)
+					writer.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+
+				//test if challenge succeeded without intervention
+				if len(nodeTemp) > 0 {
+					for i := 0; i < len(nodeTemp[0].Attributes)-1; i++ {
+						//success text visible
+						if nodeTemp[0].Attributes[i] == "style" && nodeTemp[0].Attributes[i+1] != "display: none;" {
+							fmt.Println("challenge passed without intervention")
+							state = stateCloudflareFinishWait
+							goto switchStart
+						}
+					}
+				}
+			}
+
 			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
 				chromedp.Screenshot("//div[\"turnstile-wrapper\"]/iframe", &iframePic, chromedp.BySearch),
 			)
 			if err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
+				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 
-			elImg, _ := png.Decode(bytes.NewReader(iframePic))
+			elImg, err = png.Decode(bytes.NewReader(iframePic))
 			if err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "chromedp returned invalid png screenshot: %v", err)
+				//arbitrary data being passed to console
+				_, _ = fmt.Fprintf(os.Stderr, "error getting page %s: chromedp returned invalid png screenshot: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 
 			c := calculateModalAverageColour(elImg)
+			//fmt.Println(c)
 
 			//check how far average color is from known image of challenge checkbox state
-			if math.Abs(float64(c[0])-238)+math.Abs(float64(c[1])-246)+math.Abs(float64(c[2])-235) < 2 {
-				break
+			if math.Abs(float64(c[0])-238)+math.Abs(float64(c[1])-236)+math.Abs(float64(c[2])-235) < 2 {
+				//fmt.Println("checkbox ready")
+				state = stateCloudflareCheckbox
 			}
-		}
+		case stateCloudflareCheckbox:
+			//random wait
+			time.Sleep(time.Duration(rand.Intn(250)+300) * time.Millisecond)
 
-		//click button to start solve
-		err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
-			//chromedp.WaitReady("//div[\"turnstile-wrapper\"]/iframe", chromedp.ByJSPath),
-			//chromedp.Sleep(10*time.Second),
-			chromedp.Click("//div[\"turnstile-wrapper\"]/iframe/..", chromedp.BySearch),
-			chromedp.WaitNotVisible("//*[@id=\"footer-text\"]/a", chromedp.BySearch),
-		)
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v", string(url), err)
+			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+				//chromedp.WaitReady("//div[\"turnstile-wrapper\"]/iframe", chromedp.ByJSPath),
+				//chromedp.Sleep(10*time.Second),
+				chromedp.Click("//div[\"turnstile-wrapper\"]/iframe/..", chromedp.BySearch),
+				//chromedp.WaitNotVisible("//*[@id=\"footer-text\"]/a", chromedp.BySearch),
+			)
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v\n", string(url), err)
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			passTime = time.Now()
+			state = stateCloudflareFinishWait
+		case stateCloudflareFinishWait:
+			//timeout in case challenge fails but pretends you passed
+			if passTime.Add(10 * time.Second).Before(time.Now()) {
+				fmt.Println("timeout waiting on challenge")
+				//restart everything
+				err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+					chromedp.Reload(),
+				)
+				if err != nil {
+					//arbitrary data being passed to console
+					_, _ = fmt.Fprintf(os.Stderr, "error reloading page %s: %v\n", string(url), err)
+					writer.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+
+				state = stateInitialCheck
+				goto switchStart
+			}
+			sCtx, sCancel := context.WithTimeout(Users[curr][uint32(sessId)].Ctx, 500*time.Millisecond)
+			err = chromedp.Run(sCtx,
+				chromedp.Nodes("//*[@id=\"footer-text\"]/a", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
+			)
+			sCancel()
+			if err != nil && err != context.DeadlineExceeded {
+				_, _ = fmt.Fprintf(os.Stderr, "error waiting for footer to disappear on page %s: %v\n", string(url), err)
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			if len(nodeTemp) < 1 {
+				state = stateUnprotectedGet
+			}
+		case stateUnprotectedGet:
+			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+				//chromedp.Navigate(string(url)),
+				chromedp.Reload(),
+				chromedp.OuterHTML("body", &page, chromedp.ByQuery),
+				//chromedp.Text("", &page, chromedp.ByQuery),
+			)
+			if err != nil {
+				//arbitrary data being passed to console
+				_, _ = fmt.Fprintf(os.Stderr, "error getting page %s: %v\n", string(url), err)
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			goto doneGet
+		default:
+			_, _ = fmt.Fprintf(os.Stderr, "impossible state %d during get of %s", state, string(url))
 			writer.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-	challengePassed:
-		fmt.Println("cf bypassed")
 	}
-
-	err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
-		//chromedp.Navigate(string(url)),
-		chromedp.OuterHTML("body", &page, chromedp.ByQuery),
-		//chromedp.Text("", &page, chromedp.ByQuery),
-	)
-	if err != nil {
-		//arbitrary data being passed to console
-		_, _ = fmt.Fprintf(os.Stderr, "error getting page %s: %v", string(url), err)
-		writer.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+doneGet:
 
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write([]byte(page))
 	return
 }
 
+func timeoutRun(ctx context.Context, action ...chromedp.Action) error {
+	var err error
+
+	sCtx, sCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	err = chromedp.Run(sCtx, action...)
+	sCancel()
+
+	return err
+}
+
 type PixelColor [3]uint8
 
+// wholesale yoinked from online because i was lazy
 func calculateModalAverageColour(img image.Image) PixelColor {
 	imgSize := img.Bounds().Size()
 
