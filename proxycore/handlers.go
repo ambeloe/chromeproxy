@@ -72,7 +72,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	sess.Ctx, sess.Cf, err = cu.New(cu.NewConfig(
-		//cu.WithHeadless(),
+		cu.WithHeadless(),
 		cu.WithChromeFlags(chromedp.UserDataDir(sess.UserDir)),
 		cu.WithTimeout(time.Duration(math.MaxInt64)), //because why the hell does the chrome handle expire
 	))
