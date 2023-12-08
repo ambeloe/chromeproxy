@@ -72,7 +72,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	sess.Ctx, sess.Cf, err = cu.New(cu.NewConfig(
-		cu.WithHeadless(),
+		//cu.WithHeadless(),
 		cu.WithChromeFlags(chromedp.UserDataDir(sess.UserDir)),
 		cu.WithTimeout(time.Duration(math.MaxInt64)), //because why the hell does the chrome handle expire
 	))
@@ -204,12 +204,14 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 		fmt.Printf("[%s] state: %d\n", time.Now().Format("2006-01-02 15:04:05.999999999"), state)
 		switch state {
 		case stateInitialCheck:
-			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
 				//ensures captcha for development (never lets you pass though)
 				//cu.UserAgentOverride("Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36"),
 				chromedp.Navigate(string(url)),
 			)
-			if err != nil && err != context.DeadlineExceeded {
+			if err == context.DeadlineExceeded {
+				goto switchStart
+			} else if err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
@@ -252,12 +254,26 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 						}
 					}
 				}
+
+				//passed before success text was detected
+				err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+					chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
+				)
+				if err != nil && err != context.DeadlineExceeded {
+					_, _ = fmt.Fprintf(os.Stderr, "error finding footer on page %s: %v\n", string(url), err)
+					writer.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+
+				if !(len(nodeTemp) > 0 && nodeTemp[0].NodeValue == "Cloudflare") {
+					state = stateUnprotectedGet
+				}
 			}
 
-			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
 				chromedp.Screenshot("//div[\"turnstile-wrapper\"]/iframe", &iframePic, chromedp.BySearch),
 			)
-			if err != nil {
+			if err != nil && err != context.DeadlineExceeded {
 				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
@@ -283,13 +299,13 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			//random wait
 			time.Sleep(time.Duration(rand.Intn(250)+300) * time.Millisecond)
 
-			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
 				//chromedp.WaitReady("//div[\"turnstile-wrapper\"]/iframe", chromedp.ByJSPath),
 				//chromedp.Sleep(10*time.Second),
 				chromedp.Click("//div[\"turnstile-wrapper\"]/iframe/..", chromedp.BySearch),
 				//chromedp.WaitNotVisible("//*[@id=\"footer-text\"]/a", chromedp.BySearch),
 			)
-			if err != nil {
+			if err != nil && err != context.DeadlineExceeded {
 				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
@@ -302,10 +318,12 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			if passTime.Add(10 * time.Second).Before(time.Now()) {
 				fmt.Println("timeout waiting on challenge")
 				//restart everything
-				err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+				err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
 					chromedp.Reload(),
 				)
-				if err != nil {
+				if err == context.DeadlineExceeded {
+					goto switchStart
+				} else if err != nil {
 					//arbitrary data being passed to console
 					_, _ = fmt.Fprintf(os.Stderr, "error reloading page %s: %v\n", string(url), err)
 					writer.WriteHeader(http.StatusInternalServerError)
@@ -315,12 +333,12 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				state = stateInitialCheck
 				goto switchStart
 			}
-			sCtx, sCancel := context.WithTimeout(Users[curr][uint32(sessId)].Ctx, 500*time.Millisecond)
-			err = chromedp.Run(sCtx,
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
 				chromedp.Nodes("//*[@id=\"footer-text\"]/a", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
 			)
-			sCancel()
-			if err != nil && err != context.DeadlineExceeded {
+			if err == context.DeadlineExceeded {
+				goto switchStart
+			} else if err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "error waiting for footer to disappear on page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
@@ -330,13 +348,16 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				state = stateUnprotectedGet
 			}
 		case stateUnprotectedGet:
-			err = chromedp.Run(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
 				//chromedp.Navigate(string(url)),
 				chromedp.Reload(),
 				chromedp.OuterHTML("body", &page, chromedp.ByQuery),
 				//chromedp.Text("", &page, chromedp.ByQuery),
 			)
-			if err != nil {
+			if err == context.DeadlineExceeded {
+				fmt.Println("timed out waiting on page load, trying again")
+				goto switchStart
+			} else if err != nil {
 				//arbitrary data being passed to console
 				_, _ = fmt.Fprintf(os.Stderr, "error getting page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
@@ -357,9 +378,13 @@ doneGet:
 }
 
 func timeoutRun(ctx context.Context, action ...chromedp.Action) error {
+	return timeoutRunT(500*time.Millisecond, ctx, action...)
+}
+
+func timeoutRunT(timeout time.Duration, ctx context.Context, action ...chromedp.Action) error {
 	var err error
 
-	sCtx, sCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	sCtx, sCancel := context.WithTimeout(ctx, timeout)
 	err = chromedp.Run(sCtx, action...)
 	sCancel()
 
