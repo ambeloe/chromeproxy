@@ -15,6 +15,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	url2 "net/url"
 	"os"
 	"strconv"
 	"time"
@@ -59,7 +60,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	//find available session id
 	for {
 		sess.Id = rand.Uint32()
-		if _, exists := Users[curr][sess.Id]; !exists && sess.Id != 0 {
+		if _, exists := users[curr][sess.Id]; !exists && sess.Id != 0 {
 			break
 		}
 	}
@@ -88,7 +89,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	Users[curr][sess.Id] = sess
+	users[curr][sess.Id] = sess
 
 	writer.Header().Add("SESSION", strconv.FormatUint(uint64(sess.Id), 16))
 	writer.WriteHeader(http.StatusOK)
@@ -115,7 +116,7 @@ func HandleKillSession(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if _, exists := Users[curr][uint32(sessId)]; !exists {
+	if _, exists := users[curr][uint32(sessId)]; !exists {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -139,7 +140,7 @@ func HandleKillALlSessions(writer http.ResponseWriter, request *http.Request) {
 	var err error
 	var fucked bool
 
-	for _, s := range Users[curr] {
+	for _, s := range users[curr] {
 		err = killSession(curr, s.Id)
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "error killing session %s:%x: %v\n", curr, s.Id, err)
@@ -177,7 +178,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if _, exists := Users[curr][uint32(sessId)]; !exists {
+	if _, exists := users[curr][uint32(sessId)]; !exists {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -204,7 +205,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 		fmt.Printf("[%s] state: %d\n", time.Now().Format("2006-01-02 15:04:05.999999999"), state)
 		switch state {
 		case stateInitialCheck:
-			err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRunT(10*time.Second, users[curr][uint32(sessId)].Ctx,
 				//ensures captcha for development (never lets you pass though)
 				//cu.UserAgentOverride("Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36"),
 				chromedp.Navigate(string(url)),
@@ -217,7 +218,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				return
 			}
 
-			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
 				chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
 			)
 			if err != nil && err != context.DeadlineExceeded {
@@ -234,7 +235,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			}
 		case stateCloudflareLoadWait:
 			{
-				err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+				err = timeoutRun(users[curr][uint32(sessId)].Ctx,
 					chromedp.Nodes("//div[@id=\"challenge-success\"]/", &nodeTemp, chromedp.BySearch, chromedp.NodeReady),
 				)
 				if err != nil && err != context.DeadlineExceeded {
@@ -256,7 +257,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				}
 
 				//passed before success text was detected
-				err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+				err = timeoutRun(users[curr][uint32(sessId)].Ctx,
 					chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
 				)
 				if err != nil && err != context.DeadlineExceeded {
@@ -270,7 +271,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				}
 			}
 
-			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
 				chromedp.Screenshot("//div[\"turnstile-wrapper\"]/iframe", &iframePic, chromedp.BySearch),
 			)
 			if err != nil && err != context.DeadlineExceeded {
@@ -299,7 +300,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			//random wait
 			time.Sleep(time.Duration(rand.Intn(250)+300) * time.Millisecond)
 
-			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
 				//chromedp.WaitReady("//div[\"turnstile-wrapper\"]/iframe", chromedp.ByJSPath),
 				//chromedp.Sleep(10*time.Second),
 				chromedp.Click("//div[\"turnstile-wrapper\"]/iframe/..", chromedp.BySearch),
@@ -318,7 +319,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			if passTime.Add(10 * time.Second).Before(time.Now()) {
 				fmt.Println("timeout waiting on challenge")
 				//restart everything
-				err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
+				err = timeoutRunT(10*time.Second, users[curr][uint32(sessId)].Ctx,
 					chromedp.Reload(),
 				)
 				if err == context.DeadlineExceeded {
@@ -333,7 +334,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				state = stateInitialCheck
 				goto switchStart
 			}
-			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
 				chromedp.Nodes("//*[@id=\"footer-text\"]/a", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
 			)
 			if err == context.DeadlineExceeded {
@@ -348,7 +349,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				state = stateUnprotectedGet
 			}
 		case stateUnprotectedGet:
-			err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
+			err = timeoutRunT(10*time.Second, users[curr][uint32(sessId)].Ctx,
 				//chromedp.Navigate(string(url)),
 				chromedp.Reload(),
 				chromedp.OuterHTML("body", &page, chromedp.ByQuery),
@@ -360,6 +361,12 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			} else if err != nil {
 				//arbitrary data being passed to console
 				_, _ = fmt.Fprintf(os.Stderr, "error getting page %s: %v\n", string(url), err)
+				if Debug >= DebugError {
+					err = os.WriteFile(fmt.Sprintf("chromeproxy_geterror_%s_%s.html", url2.PathEscape(string(url))), []byte(page), 0644)
+					if err != nil {
+						_, _ = fmt.Fprintf(os.Stderr, "error writing debug error output %s")
+					}
+				}
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}

@@ -6,8 +6,10 @@ import (
 )
 import "context"
 
-// Users map[user_key]map[session_id]Session
-var Users = make(map[string]map[uint32]Session)
+// users map[user_key]map[session_id]Session
+var users = make(map[string]map[uint32]Session)
+
+var Debug DebugLevel = DebugInfo
 
 type Session struct {
 	Id uint32
@@ -20,7 +22,7 @@ type Session struct {
 
 func authorized(req *http.Request) bool {
 	if k := req.Header.Get("KEY"); k != "" {
-		if _, exists := Users[k]; exists {
+		if _, exists := users[k]; exists {
 			return true
 		} else {
 			return false
@@ -31,14 +33,14 @@ func authorized(req *http.Request) bool {
 }
 
 func killSession(userKey string, id uint32) error {
-	Users[userKey][id].Cf()
+	users[userKey][id].Cf()
 
-	return os.RemoveAll(Users[userKey][id].UserDir)
+	return os.RemoveAll(users[userKey][id].UserDir)
 }
 
 // AddUser adds a user if they don't already exist
 func AddUser(userKey string) {
-	if _, exists := Users[userKey]; !exists {
-		Users[userKey] = map[uint32]Session{}
+	if _, exists := users[userKey]; !exists {
+		users[userKey] = map[uint32]Session{}
 	}
 }
