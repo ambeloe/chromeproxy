@@ -15,7 +15,6 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
-	url2 "net/url"
 	"os"
 	"strconv"
 	"time"
@@ -30,6 +29,8 @@ const (
 
 	stateUnprotectedGet
 )
+
+const CloudflarePresentXPath = "//p[text()[contains(., \"Your Ray ID for this request is\")]]"
 
 func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	if !authorized(request) {
@@ -60,7 +61,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	//find available session id
 	for {
 		sess.Id = rand.Uint32()
-		if _, exists := users[curr][sess.Id]; !exists && sess.Id != 0 {
+		if _, exists := Users[curr][sess.Id]; !exists && sess.Id != 0 {
 			break
 		}
 	}
@@ -73,7 +74,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	sess.Ctx, sess.Cf, err = cu.New(cu.NewConfig(
-		cu.WithHeadless(),
+		//cu.WithHeadless(),
 		cu.WithChromeFlags(chromedp.UserDataDir(sess.UserDir)),
 		cu.WithTimeout(time.Duration(math.MaxInt64)), //because why the hell does the chrome handle expire
 	))
@@ -89,7 +90,7 @@ func HandleStartSession(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	users[curr][sess.Id] = sess
+	Users[curr][sess.Id] = sess
 
 	writer.Header().Add("SESSION", strconv.FormatUint(uint64(sess.Id), 16))
 	writer.WriteHeader(http.StatusOK)
@@ -116,7 +117,7 @@ func HandleKillSession(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if _, exists := users[curr][uint32(sessId)]; !exists {
+	if _, exists := Users[curr][uint32(sessId)]; !exists {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -140,7 +141,7 @@ func HandleKillALlSessions(writer http.ResponseWriter, request *http.Request) {
 	var err error
 	var fucked bool
 
-	for _, s := range users[curr] {
+	for _, s := range Users[curr] {
 		err = killSession(curr, s.Id)
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "error killing session %s:%x: %v\n", curr, s.Id, err)
@@ -178,7 +179,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if _, exists := users[curr][uint32(sessId)]; !exists {
+	if _, exists := Users[curr][uint32(sessId)]; !exists {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -205,7 +206,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 		fmt.Printf("[%s] state: %d\n", time.Now().Format("2006-01-02 15:04:05.999999999"), state)
 		switch state {
 		case stateInitialCheck:
-			err = timeoutRunT(10*time.Second, users[curr][uint32(sessId)].Ctx,
+			err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
 				//ensures captcha for development (never lets you pass though)
 				//cu.UserAgentOverride("Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36"),
 				chromedp.Navigate(string(url)),
@@ -218,16 +219,17 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				return
 			}
 
-			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
-				chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
+			//test if captcha is present
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+				chromedp.Nodes(CloudflarePresentXPath, &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
 			)
 			if err != nil && err != context.DeadlineExceeded {
-				_, _ = fmt.Fprintf(os.Stderr, "error finding footer on page %s: %v\n", string(url), err)
+				_, _ = fmt.Fprintf(os.Stderr, "error detecting cloudflare on page %s: %v\n", string(url), err)
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 
-			if len(nodeTemp) > 0 && nodeTemp[0].NodeValue == "Cloudflare" {
+			if len(nodeTemp) > 0 {
 				_, _ = fmt.Fprintf(os.Stdout, "bypassing cf challenge on page %s...\n", string(url))
 				state = stateCloudflareLoadWait
 			} else {
@@ -235,7 +237,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			}
 		case stateCloudflareLoadWait:
 			{
-				err = timeoutRun(users[curr][uint32(sessId)].Ctx,
+				err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
 					chromedp.Nodes("//div[@id=\"challenge-success\"]/", &nodeTemp, chromedp.BySearch, chromedp.NodeReady),
 				)
 				if err != nil && err != context.DeadlineExceeded {
@@ -257,8 +259,8 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				}
 
 				//passed before success text was detected
-				err = timeoutRun(users[curr][uint32(sessId)].Ctx,
-					chromedp.Nodes("//*[@id=\"footer-text\"]/a/text()", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
+				err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+					chromedp.Nodes(CloudflarePresentXPath, &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
 				)
 				if err != nil && err != context.DeadlineExceeded {
 					_, _ = fmt.Fprintf(os.Stderr, "error finding footer on page %s: %v\n", string(url), err)
@@ -266,13 +268,13 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 					return
 				}
 
-				if !(len(nodeTemp) > 0 && nodeTemp[0].NodeValue == "Cloudflare") {
+				if !(len(nodeTemp) > 0) {
 					state = stateUnprotectedGet
 				}
 			}
 
-			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
-				chromedp.Screenshot("//div[\"turnstile-wrapper\"]/iframe", &iframePic, chromedp.BySearch),
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+				chromedp.Screenshot("//h1/../div[@class=\"main-wrapper\"]", &iframePic, chromedp.BySearch),
 			)
 			if err != nil && err != context.DeadlineExceeded {
 				_, _ = fmt.Fprintf(os.Stderr, "error navigating to page %s: %v\n", string(url), err)
@@ -289,21 +291,22 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			}
 
 			c := calculateModalAverageColour(elImg)
-			//fmt.Println(c)
+			fmt.Println(c)
 
 			//check how far average color is from known image of challenge checkbox state
-			if math.Abs(float64(c[0])-238)+math.Abs(float64(c[1])-236)+math.Abs(float64(c[2])-235) < 2 {
+			if math.Abs(float64(c[0])-243)+math.Abs(float64(c[1])-242)+math.Abs(float64(c[2])-241) < 4 {
 				//fmt.Println("checkbox ready")
 				state = stateCloudflareCheckbox
 			}
+			time.Sleep(250 * time.Millisecond)
 		case stateCloudflareCheckbox:
 			//random wait
 			time.Sleep(time.Duration(rand.Intn(250)+300) * time.Millisecond)
 
-			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
 				//chromedp.WaitReady("//div[\"turnstile-wrapper\"]/iframe", chromedp.ByJSPath),
 				//chromedp.Sleep(10*time.Second),
-				chromedp.Click("//div[\"turnstile-wrapper\"]/iframe/..", chromedp.BySearch),
+				chromedp.Click("//h1/../div[@class=\"main-wrapper\"]", chromedp.BySearch),
 				//chromedp.WaitNotVisible("//*[@id=\"footer-text\"]/a", chromedp.BySearch),
 			)
 			if err != nil && err != context.DeadlineExceeded {
@@ -315,11 +318,12 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			passTime = time.Now()
 			state = stateCloudflareFinishWait
 		case stateCloudflareFinishWait:
+			time.Sleep(100 * time.Millisecond)
 			//timeout in case challenge fails but pretends you passed
-			if passTime.Add(10 * time.Second).Before(time.Now()) {
+			if passTime.Add(20 * time.Second).Before(time.Now()) {
 				fmt.Println("timeout waiting on challenge")
 				//restart everything
-				err = timeoutRunT(10*time.Second, users[curr][uint32(sessId)].Ctx,
+				err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
 					chromedp.Reload(),
 				)
 				if err == context.DeadlineExceeded {
@@ -334,8 +338,8 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				state = stateInitialCheck
 				goto switchStart
 			}
-			err = timeoutRun(users[curr][uint32(sessId)].Ctx,
-				chromedp.Nodes("//*[@id=\"footer-text\"]/a", &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
+			err = timeoutRun(Users[curr][uint32(sessId)].Ctx,
+				chromedp.Nodes(CloudflarePresentXPath, &nodeTemp, chromedp.BySearch, chromedp.AtLeast(0)),
 			)
 			if err == context.DeadlineExceeded {
 				goto switchStart
@@ -349,7 +353,7 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 				state = stateUnprotectedGet
 			}
 		case stateUnprotectedGet:
-			err = timeoutRunT(10*time.Second, users[curr][uint32(sessId)].Ctx,
+			err = timeoutRunT(10*time.Second, Users[curr][uint32(sessId)].Ctx,
 				//chromedp.Navigate(string(url)),
 				chromedp.Reload(),
 				chromedp.OuterHTML("body", &page, chromedp.ByQuery),
@@ -361,12 +365,6 @@ func HandleGet(writer http.ResponseWriter, request *http.Request) {
 			} else if err != nil {
 				//arbitrary data being passed to console
 				_, _ = fmt.Fprintf(os.Stderr, "error getting page %s: %v\n", string(url), err)
-				if Debug >= DebugError {
-					err = os.WriteFile(fmt.Sprintf("chromeproxy_geterror_%s_%s.html", url2.PathEscape(string(url))), []byte(page), 0644)
-					if err != nil {
-						_, _ = fmt.Fprintf(os.Stderr, "error writing debug error output %s")
-					}
-				}
 				writer.WriteHeader(http.StatusInternalServerError)
 				return
 			}
